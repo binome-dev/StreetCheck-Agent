@@ -1,81 +1,114 @@
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from bs4 import BeautifulSoup
-import os
-from data_cleaner import (
-    clean_summary_data, clean_housing_data, clean_people_data,
-    clean_culture_data, clean_employment_data, clean_crime_data,
-    clean_nearby_data
+import pandas as pd
+import psycopg2
+from scrapers import (
+    get_summary_data,
+    get_housing_data,
+    get_people_data,
+    get_culture_data,
+    get_employment_data,
+    get_crime_data,
+    get_nearby_data,
+    init_browser
 )
 
-# Initialize the browser
-def init_browser():
-    # Choose the chromedriver path based on the operating system
-    if os.name == 'nt':  # Windows system
-        chrome_driver_path = 'C:/Users/Lychee/chromedriver-win64/chromedriver.exe'  # Replace with your Windows path
-    else:  # Linux system (e.g., running in Docker)
-        chrome_driver_path = '/usr/bin/chromedriver'
+# Read the CSV file containing UK postcodes
+df_postcodes = pd.read_csv('Data/ukpostcodes.csv')
 
-    # Set the chromedriver path and initialize the service
-    service = Service(chrome_driver_path)
-    driver = webdriver.Chrome(service=service)
-    return driver
+# Extract the first 1000 postcodes
+postcodes = df_postcodes['postcode'][:1000]
 
-# Generic function to load a page, wait for elements, and retrieve page content
-def get_data(driver, postcode, tab_selector, content_id, cleaner_function):
-    url = f"https://www.streetcheck.co.uk/postcode/{postcode}"
-    driver.get(url)
-    
-    # Wait for the navigation bar to load
-    wait_for_element(driver, By.ID, "postcodeTabs")
-    
-    # Click the specified tab button
-    tab_button = driver.find_element(By.CSS_SELECTOR, tab_selector)
-    driver.execute_script("arguments[0].click();", tab_button)
-    
-    # Wait for the content to load
-    wait_for_element(driver, By.ID, content_id)
-    
-    # Parse the page
-    soup = BeautifulSoup(driver.page_source, 'html.parser')
-    content_section = soup.find("div", id=content_id)
-    
-    if content_section:
-        content_text = content_section.get_text(separator='\n', strip=True)
-        return cleaner_function(content_text)  # Call the passed cleaner function
-    return f"No data found for {content_id}."
+# Initialize the database connection
+def init_db():
+    conn = psycopg2.connect(
+        dbname="postcode_db", 
+        user="postgres", 
+        password="Ephemeral", 
+        host="localhost", 
+        port="9999"
+    )
+    cursor = conn.cursor()
+    return conn, cursor
 
-# Wait for an element to load
-def wait_for_element(driver, by_type, identifier):
-    WebDriverWait(driver, 10).until(EC.presence_of_element_located((by_type, identifier)))
+# Check if the postcode already exists in the database
+def postcode_exists(cursor, postcode):
+    cursor.execute('SELECT 1 FROM postcode_data WHERE postcode = %s', (postcode,))
+    return cursor.fetchone() is not None
 
-# Get Summary data
-def get_summary_data(driver, postcode):
-    return get_data(driver, postcode, 'a[href="#summary"]', "summary", clean_summary_data)
+# Insert a batch of data into the database
+def insert_data_batch(cursor, batch_data):
+    cursor.executemany('''INSERT INTO postcode_data 
+                          (postcode, summary, housing, people, culture, employment, crime, nearby) 
+                          VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                          ON CONFLICT (postcode) DO NOTHING''', batch_data)
 
-# Get Housing data
-def get_housing_data(driver, postcode):
-    return get_data(driver, postcode, 'a[href="#housing"]', "housing", clean_housing_data)
+# Extract all data for a given postcode
+def get_all_data(postcode):
+    driver = init_browser()  # Initialize browser
+    try:
+        data_extractors = {
+            "Summary": get_summary_data,
+            "Housing": get_housing_data,
+            "People": get_people_data,
+            "Culture": get_culture_data,
+            "Employment": get_employment_data,
+            "Crime": get_crime_data,
+            "Nearby": get_nearby_data
+        }
+        
+        all_data = {}
+        for section, extractor in data_extractors.items():
+            print(f"Fetching {section} data for {postcode}...")
+            all_data[section] = extractor(driver, postcode)
+        
+        return all_data
 
-# Get People data
-def get_people_data(driver, postcode):
-    return get_data(driver, postcode, 'a[href="#people"]', "people", clean_people_data)
+    finally:
+        driver.quit()
 
-# Get Culture data
-def get_culture_data(driver, postcode):
-    return get_data(driver, postcode, 'a[href="#culture"]', "culture", clean_culture_data)
+# Fetch data in batches and save to PostgreSQL database
+def save_data_to_db(postcodes, cursor, conn, batch_size=10):
+    batch_data = []
+    for postcode in postcodes:
+        # Check if postcode already exists in the database
+        if postcode_exists(cursor, postcode):
+            print(f"Postcode {postcode} already exists in the database. Skipping...")
+            continue
 
-# Get Employment data
-def get_employment_data(driver, postcode):
-    return get_data(driver, postcode, 'a[href="#employment"]', "employment", clean_employment_data)
+        # Fetch data for the postcode
+        all_data = get_all_data(postcode)
 
-# Get Crime data
-def get_crime_data(driver, postcode):
-    return get_data(driver, postcode, 'a[href="#policing"]', "policing", clean_crime_data)
+        # Add data to the batch list
+        batch_data.append((
+            postcode, 
+            all_data.get("Summary", 'N/A'),
+            all_data.get("Housing", 'N/A'),
+            all_data.get("People", 'N/A'),
+            all_data.get("Culture", 'N/A'),
+            all_data.get("Employment", 'N/A'),
+            all_data.get("Crime", 'N/A'),
+            all_data.get("Nearby", 'N/A')
+        ))
 
-# Get Nearby data
-def get_nearby_data(driver, postcode):
-    return get_data(driver, postcode, 'a[href="#nearby"]', "nearby", clean_nearby_data)
+        # Insert data and commit the transaction when batch size is reached
+        if len(batch_data) >= batch_size:
+            insert_data_batch(cursor, batch_data)
+            conn.commit()  # Commit the transaction
+            print(f"Committed a batch of {batch_size} records.")
+            batch_data.clear()  # Clear the batch data
+
+    # Insert any remaining uncommitted data
+    if batch_data:
+        insert_data_batch(cursor, batch_data)
+        conn.commit()
+        print(f"Committed the remaining {len(batch_data)} records.")
+
+if __name__ == "__main__":
+    # Initialize the database connection
+    conn, cursor = init_db()
+
+    try:
+        # Save data in batches to the database, batch size of 10
+        save_data_to_db(postcodes, cursor, conn, batch_size=10)
+    finally:
+        # Close the database connection
+        conn.close()
